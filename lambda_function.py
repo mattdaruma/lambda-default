@@ -1,6 +1,7 @@
 import boto3
 import json
 import os
+from datetime import datetime
 
 TABLE_NAME = 'moyabe-connections'
 dynamodb = boto3.resource('dynamodb')
@@ -11,12 +12,27 @@ def lambda_handler(event, context):
     connection_id = event.get('requestContext', {}).get('connectionId')
     
     try:
+        message_body = json.loads(event.get('body', '{}'))
+        action = message_body.get('action')
+
+        if action == 'profileUpdate':
+            preferred_username = message_body.get('preferredUsername')
+            table.update_item(
+                Key={'connectionId': connection_id},
+                UpdateExpression='SET preferredUsername = :val',
+                ExpressionAttributeValues={':val': preferred_username}
+            )
+            return {'statusCode': 200, 'body': 'Profile updated.'}
+
         # Get the sender's username
         response = table.get_item(Key={'connectionId': connection_id})
-        username = response.get('Item', {}).get('username', 'anonymous')
+        item = response.get('Item', {})
+        username = item.get('username', 'anonymous')
+        preferred_username = item.get('preferredUsername')
+
+        display_name = preferred_username if preferred_username and preferred_username.strip() else username
 
         # Get the message from the event body
-        message_body = json.loads(event.get('body', '{}'))
         message = message_body.get('message')
 
         if not message:
@@ -27,7 +43,12 @@ def lambda_handler(event, context):
         connections = response.get('Items', [])
 
         # Construct the message payload
-        payload = json.dumps({'sender': username, 'message': message})
+        payload = json.dumps({
+            'username': username,
+            'displayName': display_name,
+            'message': message,
+            'timestamp': datetime.utcnow().isoformat()
+        })
 
         # Get the API Gateway management client
         domain_name = event.get('requestContext', {}).get('domainName')
@@ -38,13 +59,12 @@ def lambda_handler(event, context):
         # Broadcast the message to all connections
         for connection in connections:
             conn_id = connection['connectionId']
-            if conn_id != connection_id:
-                try:
-                    apigw_management.post_to_connection(ConnectionId=conn_id, Data=payload)
-                except apigw_management.exceptions.GoneException:
-                    # Stale connection, delete it from the table
-                    print(f"Stale connection {conn_id}, deleting.")
-                    table.delete_item(Key={'connectionId': conn_id})
+            try:
+                apigw_management.post_to_connection(ConnectionId=conn_id, Data=payload)
+            except apigw_management.exceptions.GoneException:
+                # Stale connection, delete it from the table
+                print(f"Stale connection {conn_id}, deleting.")
+                table.delete_item(Key={'connectionId': conn_id})
 
         return {'statusCode': 200, 'body': 'Message sent.'}
 
